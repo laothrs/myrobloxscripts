@@ -1,0 +1,23 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Cursor
+.cursor/
+
+# Roblox place / local exports (not part of this source bundle)
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx
+
+# Logs & temp
+*.log
+tmp/

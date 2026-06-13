@@ -1,4 +1,4 @@
--- Discord: [YOUR_DISCORD_USERNAME] | Roblox: [YOUR_ROBLOX_USERNAME]
+-- Discord: [laoth_ (1168139276941271090)] | Roblox: [@LaothOnur (3160429832)]
 --!strict
 --!optimize 2
 

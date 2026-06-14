@@ -13,8 +13,20 @@ No `.rbxl` place files are included — layout mirrors how code is organized in 
 
 | Project | Focus | Where it runs |
 |---------|--------|----------------|
+| [**SolarchDataStore**](./SolarchDataStore/) | External DataStore via `HttpService` — drag-and-drop `.rbxmx`, session auth, retries, native API | `ServerScriptService` |
 | [**DataManaging**](./DataManaging/) | Server-side player data: `UpdateAsync`, schema reconciliation, session cache, `BindToClose` saves | `ServerStorage` + `ServerScriptService` |
 | [**ChunkRenderer**](./ChunkRenderer/) | Client-side map chunk streaming via reparenting (no clones), hysteresis, throttled distance checks | `StarterPlayerScripts` |
+
+### [SolarchDataStore](./SolarchDataStore/) — External DataStore client
+
+Drop-in **`DataStoreService` replacement** that talks to your own HTTPS backend.
+
+- **One-file Studio import** — [`dist/SolarchDataStore.rbxmx`](./SolarchDataStore/dist/SolarchDataStore.rbxmx) (File → Insert from File)  
+- **`GetAsync` / `SetAsync` / `UpdateAsync` / `RemoveAsync` / `IncrementAsync`** — familiar API  
+- **Session tokens**, retries, 401 refresh, rate-limit backoff  
+- **Strict Luau** + boot-time setup validator  
+
+→ [Full documentation](./SolarchDataStore/README.md)
 
 ### [DataManaging](./DataManaging/) — Player data framework
 
@@ -43,7 +55,12 @@ Keeps large worlds playable on client devices by loading only nearby map chunks 
 
 ```
 myrobloxscripts/
-├── README.md                 ← you are here
+├── README.md                      ← you are here
+├── SolarchDataStore/
+│   ├── README.md
+│   ├── dist/
+│   │   └── SolarchDataStore.rbxmx ← drag into Studio
+│   └── ServerScriptService/       ← manual module install
 ├── DataManaging/
 │   ├── README.md
 │   ├── ServerStorage/
@@ -57,9 +74,9 @@ myrobloxscripts/
 
 ## How to use
 
-1. Open the project folder you need (`DataManaging` or `ChunkRenderer`).
+1. Open the project folder you need (`SolarchDataStore`, `DataManaging`, or `ChunkRenderer`).
 2. Follow the **Setup** section in that folder’s README.
-3. Adjust constants (radii, save intervals, schema) for your game.
+3. Adjust constants (API URL, radii, save intervals, schema) for your game.
 
 These modules are **building blocks**, not full games. Pair client streaming with appropriate server authority and Roblox platform features (`StreamingEnabled`, anti-cheat, etc.) as your title requires.
 
@@ -67,7 +84,7 @@ These modules are **building blocks**, not full games. Pair client streaming wit
 
 ## Topics
 
-`roblox` · `luau` · `datastore` · `game-development` · `client-optimization` · `portfolio`
+`roblox` · `luau` · `datastore` · `httpservice` · `game-development` · `client-optimization` · `portfolio`
 
 ---
 

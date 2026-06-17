@@ -1,7 +1,7 @@
 --!strict
 --[[
-	Solarch DataStore — Yapılandırma
-	Düzenlemeniz gereken tek dosya budur.
+	Solarch DataStore — Configuration
+	Edit this file only; all other modules read from here.
 ]]
 
 export type ConfigTable = {
@@ -13,9 +13,15 @@ export type ConfigTable = {
 	MaxRetries: number,
 	RetryBaseDelay: number,
 	RequestTimeout: number,
+	UpdateAsyncMaxRetries: number,
+	DeepCopyOnRead: boolean,
+	CacheDataStoreInstances: boolean,
 	Debug: boolean,
 	RunSetupValidator: boolean,
 	StudioUniverseId: number,
+	GetUniverseId: (self: ConfigTable) -> number,
+	IsConfigured: (self: ConfigTable) -> (boolean, string?),
+	GetApiUrl: (self: ConfigTable) -> string,
 }
 
 local Config: ConfigTable = {
@@ -27,11 +33,16 @@ local Config: ConfigTable = {
 	MaxRetries = 3,
 	RetryBaseDelay = 0.5,
 	RequestTimeout = 30,
+	-- Retries on version conflict during UpdateAsync (optimistic concurrency)
+	UpdateAsyncMaxRetries = 5,
+	-- Return deep copies from GetAsync so callers cannot corrupt the session cache
+	DeepCopyOnRead = true,
+	-- Reuse DataStore instances per name+scope (Roblox DataStoreService behavior)
+	CacheDataStoreInstances = true,
 	Debug = true,
 	RunSetupValidator = true,
-	-- Studio'da game.GameId 0 olabilir; test için sabit universe ID kullanın
 	StudioUniverseId = 0,
-}
+} :: any
 
 function Config.GetUniverseId(): number
 	if Config.UniverseId and Config.UniverseId > 0 then
@@ -48,13 +59,13 @@ end
 
 function Config.IsConfigured(): (boolean, string?)
 	if Config.ApiKey == "" or Config.ApiKey == "YOUR_API_KEY_HERE" then
-		return false, "Config.ApiKey ayarlanmamış"
+		return false, "Config.ApiKey is not set"
 	end
 	if Config.ApiUrl == "" then
-		return false, "Config.ApiUrl ayarlanmamış"
+		return false, "Config.ApiUrl is not set"
 	end
 	if string.find(Config.ApiUrl, "YOUR") then
-		return false, "Config.ApiUrl geçersiz"
+		return false, "Config.ApiUrl is invalid"
 	end
 	return true, nil
 end

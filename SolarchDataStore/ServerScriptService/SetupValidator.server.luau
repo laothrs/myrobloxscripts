@@ -1,6 +1,6 @@
 --!strict
 --[[
-	Setup Validator — sunucu başlangıcında yapılandırma ve bağlantı testi.
+	Setup Validator — validates config and backend connectivity on server start.
 ]]
 
 local HttpService = game:GetService("HttpService")
@@ -19,22 +19,19 @@ local function validate()
 	end
 
 	if not HttpService.HttpEnabled then
-		warnMsg("HttpService kapalı", "Game Settings → Security → Allow HTTP Requests")
+		warnMsg("HttpService disabled", "Game Settings → Security → Allow HTTP Requests")
 		return
 	end
 
 	local configured, configErr = Config.IsConfigured()
 	if not configured then
-		warnMsg("Yapılandırma eksik", configErr or "Config modülünü kontrol edin")
+		warnMsg("Configuration incomplete", configErr or "Check Config module")
 		return
 	end
 
 	local universeId = Config.GetUniverseId()
 	if universeId <= 0 then
-		warnMsg(
-			"UniverseId bulunamadı",
-			"Studio test için Config.StudioUniverseId veya Config.UniverseId ayarlayın"
-		)
+		warnMsg("UniverseId missing", "Set Config.StudioUniverseId or Config.UniverseId for Studio testing")
 		return
 	end
 
@@ -60,17 +57,17 @@ local function validate()
 		end)
 
 		if not ok then
-			warnMsg("Backend'e bağlanılamadı", tostring(result))
+			warnMsg("Backend unreachable", tostring(result))
 			return
 		end
 
 		if not result.Success then
-			warnMsg("Backend oturum hatası", `HTTP {result.StatusCode}: {result.Body}`)
+			warnMsg("Session error", `HTTP {result.StatusCode}: {result.Body}`)
 			return
 		end
 
 		if Config.Debug then
-			print(`[SolarchDataStore] ✓ Kurulum OK — universe {universeId}, backend {apiUrl}`)
+			print(`[SolarchDataStore] ✓ Setup OK — universe {universeId}, backend {apiUrl}`)
 		end
 	end)
 end

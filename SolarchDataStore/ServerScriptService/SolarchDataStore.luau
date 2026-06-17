@@ -1,10 +1,7 @@
 --!strict
 --[[
 	Solarch External DataStoreService
-	Native DataStoreService yerine kullanın.
-
-	local DataStoreService = require(ServerScriptService.SolarchDataStore.SolarchDataStore)
-	local store = DataStoreService:GetDataStore("PlayerData")
+	Drop-in replacement for game:GetService("DataStoreService")
 ]]
 
 local Config = require(script.Parent:WaitForChild("Config"))
@@ -38,18 +35,42 @@ local client = HttpClient.new({
 	debug = Config.Debug,
 })
 
+local instanceCache: { [string]: DataStore } = {}
+
+local function cacheKey(name: string, scope: string): string
+	return `{scope}::{name}`
+end
+
 function SolarchDataStoreService:GetDataStore(name: string, scope: string?): DataStore
-	assert(typeof(name) == "string" and name ~= "", "DataStore adı boş olamaz")
+	assert(typeof(name) == "string" and name ~= "", "DataStore name must be a non-empty string")
 	local ok, errMsg = Config.IsConfigured()
 	if not ok then
-		error(Errors.toString(Errors.new("ConfigError", errMsg or "Yapılandırma hatası")), 2)
+		error(Errors.toString(Errors.new("ConfigError", errMsg or "Configuration error")), 2)
 	end
-	return DataStoreModule.new({
+
+	local resolvedScope = scope or Config.DefaultScope
+	if Config.CacheDataStoreInstances then
+		local key = cacheKey(name, resolvedScope)
+		local cached = instanceCache[key]
+		if cached then
+			return cached
+		end
+	end
+
+	local ds = DataStoreModule.new({
 		httpClient = client,
-		scope = scope or Config.DefaultScope,
+		scope = resolvedScope,
 		namePrefix = name,
 		debug = Config.Debug,
+		deepCopyOnRead = Config.DeepCopyOnRead,
+		updateAsyncMaxRetries = Config.UpdateAsyncMaxRetries,
 	})
+
+	if Config.CacheDataStoreInstances then
+		instanceCache[cacheKey(name, resolvedScope)] = ds
+	end
+
+	return ds
 end
 
 function SolarchDataStoreService:GetGlobalDataStore(): DataStore

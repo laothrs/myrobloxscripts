@@ -33,6 +33,7 @@ function HttpClient.new(options: HttpClientOptions): HttpClient
 	self._apiUrl = options.apiUrl
 	self._sessionToken = nil :: string?
 	self._sessionExpiresAt = 0
+	self._refreshing = false
 	return self
 end
 
@@ -49,9 +50,19 @@ function HttpClient:GetSessionToken(): (string?, Errors.DataStoreError?)
 	if self._options.universeId <= 0 then
 		return nil, Errors.new(
 			"ConfigError",
-			"UniverseId geçersiz. Config.UniverseId veya Config.StudioUniverseId ayarlayın (Studio'da GameId 0 olabilir)."
+			"Invalid UniverseId — set Config.UniverseId or Config.StudioUniverseId (GameId is 0 in Studio)."
 		)
 	end
+
+	while self._refreshing do
+		task.wait()
+	end
+
+	if self._sessionToken and os.clock() < self._sessionExpiresAt then
+		return self._sessionToken, nil
+	end
+
+	self._refreshing = true
 
 	local ok, response = pcall(function()
 		return HttpService:RequestAsync({
@@ -68,6 +79,8 @@ function HttpClient:GetSessionToken(): (string?, Errors.DataStoreError?)
 		})
 	end)
 
+	self._refreshing = false
+
 	if not ok then
 		return nil, Errors.new("NetworkError", tostring(response))
 	end
@@ -80,13 +93,24 @@ function HttpClient:GetSessionToken(): (string?, Errors.DataStoreError?)
 		return HttpService:JSONDecode(response.Body)
 	end)
 	if not decodeOk or typeof(body) ~= "table" or body.accessToken == nil then
-		return nil, Errors.new("InternalError", "Session yanıtı geçersiz")
+		return nil, Errors.new("InternalError", "Invalid session response")
 	end
 
 	self._sessionToken = body.accessToken
 	self._sessionExpiresAt = os.clock() + (body.expiresIn or 300) - self._options.sessionRefreshBuffer
-	log(self._options.debug, "Session token alındı")
+	log(self._options.debug, "Session token acquired")
 	return self._sessionToken, nil
+end
+
+function HttpClient:_backoff(attempt: number, statusCode: number?): number
+	local base = self._options.retryBaseDelay * attempt
+	if statusCode == 429 then
+		return base * 3
+	end
+	if statusCode and statusCode >= 500 then
+		return base * 2
+	end
+	return base
 end
 
 function HttpClient:Request(method: string, path: string, body: any?): (any?, Errors.DataStoreError?)
@@ -132,7 +156,7 @@ function HttpClient:Request(method: string, path: string, body: any?): (any?, Er
 
 			if response.StatusCode == 429 or response.StatusCode >= 500 then
 				lastError = Errors.fromHttpStatus(response.StatusCode, response.Body)
-				task.wait(self._options.retryBaseDelay * attempt * 2)
+				task.wait(self:_backoff(attempt, response.StatusCode))
 				continue
 			end
 
@@ -147,13 +171,13 @@ function HttpClient:Request(method: string, path: string, body: any?): (any?, Er
 			return HttpService:JSONDecode(response.Body)
 		end)
 		if not decodeOk then
-			return nil, Errors.new("InternalError", "JSON çözümleme hatası")
+			return nil, Errors.new("InternalError", "JSON decode failed")
 		end
 
 		return decoded, nil
 	end
 
-	return nil, lastError or Errors.new("NetworkError", "İstek tüm denemelerden sonra başarısız oldu")
+	return nil, lastError or Errors.new("NetworkError", "Request failed after all retries")
 end
 
 return HttpClient

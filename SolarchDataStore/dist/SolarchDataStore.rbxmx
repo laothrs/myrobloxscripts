@@ -9,8 +9,8 @@
         <token name="RunContext">0</token>
         <ProtectedString name="Source"><![CDATA[--!strict
 --[[
-	Solarch DataStore — Yapılandırma
-	Düzenlemeniz gereken tek dosya budur.
+	Solarch DataStore — Configuration
+	Edit this file only; all other modules read from here.
 ]]
 
 export type ConfigTable = {
@@ -22,9 +22,15 @@ export type ConfigTable = {
 	MaxRetries: number,
 	RetryBaseDelay: number,
 	RequestTimeout: number,
+	UpdateAsyncMaxRetries: number,
+	DeepCopyOnRead: boolean,
+	CacheDataStoreInstances: boolean,
 	Debug: boolean,
 	RunSetupValidator: boolean,
 	StudioUniverseId: number,
+	GetUniverseId: (self: ConfigTable) -> number,
+	IsConfigured: (self: ConfigTable) -> (boolean, string?),
+	GetApiUrl: (self: ConfigTable) -> string,
 }
 
 local Config: ConfigTable = {
@@ -36,11 +42,16 @@ local Config: ConfigTable = {
 	MaxRetries = 3,
 	RetryBaseDelay = 0.5,
 	RequestTimeout = 30,
+	-- Retries on version conflict during UpdateAsync (optimistic concurrency)
+	UpdateAsyncMaxRetries = 5,
+	-- Return deep copies from GetAsync so callers cannot corrupt the session cache
+	DeepCopyOnRead = true,
+	-- Reuse DataStore instances per name+scope (Roblox DataStoreService behavior)
+	CacheDataStoreInstances = true,
 	Debug = true,
 	RunSetupValidator = true,
-	-- Studio'da game.GameId 0 olabilir; test için sabit universe ID kullanın
 	StudioUniverseId = 0,
-}
+} :: any
 
 function Config.GetUniverseId(): number
 	if Config.UniverseId and Config.UniverseId > 0 then
@@ -57,13 +68,13 @@ end
 
 function Config.IsConfigured(): (boolean, string?)
 	if Config.ApiKey == "" or Config.ApiKey == "YOUR_API_KEY_HERE" then
-		return false, "Config.ApiKey ayarlanmamış"
+		return false, "Config.ApiKey is not set"
 	end
 	if Config.ApiUrl == "" then
-		return false, "Config.ApiUrl ayarlanmamış"
+		return false, "Config.ApiUrl is not set"
 	end
 	if string.find(Config.ApiUrl, "YOUR") then
-		return false, "Config.ApiUrl geçersiz"
+		return false, "Config.ApiUrl is invalid"
 	end
 	return true, nil
 end
@@ -139,6 +150,167 @@ return Errors
     </Item>
     <Item class="ModuleScript" referent="RBX4">
       <Properties>
+        <string name="Name">Util</string>
+        <token name="RunContext">0</token>
+        <ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Shared utilities — deep copy, table merge, key validation helpers.
+]]
+
+local Util = {}
+
+export type JSONValue = string | number | boolean | { [string]: JSONValue } | { JSONValue }
+
+function Util.deepCopy<T>(value: T): T
+	local t = typeof(value)
+	if t ~= "table" then
+		return value
+	end
+	local copy = {} :: any
+	for k, v in pairs(value :: any) do
+		copy[Util.deepCopy(k)] = Util.deepCopy(v)
+	end
+	return copy :: T
+end
+
+function Util.reconcile(data: { [string]: any }, template: { [string]: any }): { [string]: any }
+	local result = Util.deepCopy(data)
+	for key, defaultValue in pairs(template) do
+		local current = result[key]
+		if current == nil then
+			result[key] = Util.deepCopy(defaultValue)
+		elseif typeof(current) == "table" and typeof(defaultValue) == "table" then
+			result[key] = Util.reconcile(current, defaultValue)
+		end
+	end
+	return result
+end
+
+function Util.isValidKey(key: string): (boolean, string?)
+	if typeof(key) ~= "string" or key == "" then
+		return false, "Key must be a non-empty string"
+	end
+	if #key > 256 then
+		return false, "Key must be 256 characters or fewer"
+	end
+	if string.find(key, "\0") then
+		return false, "Key cannot contain null bytes"
+	end
+	return true, nil
+end
+
+function Util.trimUrl(url: string): string
+	if string.sub(url, -1) == "/" then
+		return string.sub(url, 1, -2)
+	end
+	return url
+end
+
+return Util
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX5">
+      <Properties>
+        <string name="Name">KeyQueue</string>
+        <token name="RunContext">0</token>
+        <ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Per-key async queue — serializes mutations on the same key to prevent
+	race conditions (mirrors Roblox DataStore ordering guarantees per key).
+]]
+
+export type KeyQueue = {
+	Enqueue: <T>(self: KeyQueue, key: string, operation: () -> T) -> T,
+	Clear: (self: KeyQueue, key: string?) -> (),
+}
+
+local KeyQueue = {}
+KeyQueue.__index = KeyQueue
+
+type QueueEntry = {
+	running: boolean,
+	pending: { () -> () },
+}
+
+function KeyQueue.new(): KeyQueue
+	local self = setmetatable({}, KeyQueue)
+	self._queues = {} :: { [string]: QueueEntry }
+	return self
+end
+
+function KeyQueue:_getOrCreate(key: string): QueueEntry
+	local entry = self._queues[key]
+	if entry then
+		return entry
+	end
+	entry = { running = false, pending = {} }
+	self._queues[key] = entry
+	return entry
+end
+
+function KeyQueue:_drain(key: string, entry: QueueEntry)
+	if entry.running then
+		return
+	end
+	local nextFn = table.remove(entry.pending, 1)
+	if not nextFn then
+		self._queues[key] = nil
+		return
+	end
+	entry.running = true
+	task.spawn(function()
+		local ok, err = pcall(nextFn)
+		entry.running = false
+		if not ok then
+			warn(`[KeyQueue] Operation failed for "{key}": {err}`)
+		end
+		self:_drain(key, entry)
+	end)
+end
+
+function KeyQueue:Enqueue<T>(key: string, operation: () -> T): T
+	local finished = false
+	local result: any = nil
+	local thrown: any = nil
+
+	local entry = self:_getOrCreate(key)
+	table.insert(entry.pending, function()
+		local ok, value = pcall(operation)
+		if ok then
+			result = value
+		else
+			thrown = value
+		end
+		finished = true
+	end)
+	self:_drain(key, entry)
+
+	while not finished do
+		task.wait()
+	end
+
+	if thrown ~= nil then
+		error(thrown, 2)
+	end
+
+	return result
+end
+
+function KeyQueue:Clear(key: string?)
+	if key then
+		self._queues[key] = nil
+	else
+		table.clear(self._queues)
+	end
+end
+
+return KeyQueue
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX6">
+      <Properties>
         <string name="Name">HttpClient</string>
         <token name="RunContext">0</token>
         <ProtectedString name="Source"><![CDATA[--!strict
@@ -176,6 +348,7 @@ function HttpClient.new(options: HttpClientOptions): HttpClient
 	self._apiUrl = options.apiUrl
 	self._sessionToken = nil :: string?
 	self._sessionExpiresAt = 0
+	self._refreshing = false
 	return self
 end
 
@@ -192,9 +365,19 @@ function HttpClient:GetSessionToken(): (string?, Errors.DataStoreError?)
 	if self._options.universeId <= 0 then
 		return nil, Errors.new(
 			"ConfigError",
-			"UniverseId geçersiz. Config.UniverseId veya Config.StudioUniverseId ayarlayın (Studio'da GameId 0 olabilir)."
+			"Invalid UniverseId — set Config.UniverseId or Config.StudioUniverseId (GameId is 0 in Studio)."
 		)
 	end
+
+	while self._refreshing do
+		task.wait()
+	end
+
+	if self._sessionToken and os.clock() < self._sessionExpiresAt then
+		return self._sessionToken, nil
+	end
+
+	self._refreshing = true
 
 	local ok, response = pcall(function()
 		return HttpService:RequestAsync({
@@ -211,6 +394,8 @@ function HttpClient:GetSessionToken(): (string?, Errors.DataStoreError?)
 		})
 	end)
 
+	self._refreshing = false
+
 	if not ok then
 		return nil, Errors.new("NetworkError", tostring(response))
 	end
@@ -223,13 +408,24 @@ function HttpClient:GetSessionToken(): (string?, Errors.DataStoreError?)
 		return HttpService:JSONDecode(response.Body)
 	end)
 	if not decodeOk or typeof(body) ~= "table" or body.accessToken == nil then
-		return nil, Errors.new("InternalError", "Session yanıtı geçersiz")
+		return nil, Errors.new("InternalError", "Invalid session response")
 	end
 
 	self._sessionToken = body.accessToken
 	self._sessionExpiresAt = os.clock() + (body.expiresIn or 300) - self._options.sessionRefreshBuffer
-	log(self._options.debug, "Session token alındı")
+	log(self._options.debug, "Session token acquired")
 	return self._sessionToken, nil
+end
+
+function HttpClient:_backoff(attempt: number, statusCode: number?): number
+	local base = self._options.retryBaseDelay * attempt
+	if statusCode == 429 then
+		return base * 3
+	end
+	if statusCode and statusCode >= 500 then
+		return base * 2
+	end
+	return base
 end
 
 function HttpClient:Request(method: string, path: string, body: any?): (any?, Errors.DataStoreError?)
@@ -275,7 +471,7 @@ function HttpClient:Request(method: string, path: string, body: any?): (any?, Er
 
 			if response.StatusCode == 429 or response.StatusCode >= 500 then
 				lastError = Errors.fromHttpStatus(response.StatusCode, response.Body)
-				task.wait(self._options.retryBaseDelay * attempt * 2)
+				task.wait(self:_backoff(attempt, response.StatusCode))
 				continue
 			end
 
@@ -290,34 +486,41 @@ function HttpClient:Request(method: string, path: string, body: any?): (any?, Er
 			return HttpService:JSONDecode(response.Body)
 		end)
 		if not decodeOk then
-			return nil, Errors.new("InternalError", "JSON çözümleme hatası")
+			return nil, Errors.new("InternalError", "JSON decode failed")
 		end
 
 		return decoded, nil
 	end
 
-	return nil, lastError or Errors.new("NetworkError", "İstek tüm denemelerden sonra başarısız oldu")
+	return nil, lastError or Errors.new("NetworkError", "Request failed after all retries")
 end
 
 return HttpClient
 ]]></ProtectedString>
       </Properties>
     </Item>
-    <Item class="ModuleScript" referent="RBX5">
+    <Item class="ModuleScript" referent="RBX7">
       <Properties>
         <string name="Name">DataStore</string>
         <token name="RunContext">0</token>
         <ProtectedString name="Source"><![CDATA[--!strict
 local HttpService = game:GetService("HttpService")
 local Errors = require(script.Parent:WaitForChild("Errors"))
+local KeyQueue = require(script.Parent:WaitForChild("KeyQueue"))
+local Util = require(script.Parent:WaitForChild("Util"))
+
+export type GetOptions = {
+	UseCache: boolean?,
+}
 
 export type DataStore = {
-	GetAsync: (self: DataStore, key: string, options: { UseCache: boolean? }?) -> any?,
+	GetAsync: (self: DataStore, key: string, options: GetOptions?) -> any?,
 	SetAsync: (self: DataStore, key: string, value: any, userIds: { number }?) -> (),
 	UpdateAsync: (self: DataStore, key: string, transform: (any?) -> any?, userIds: { number }?) -> any?,
 	RemoveAsync: (self: DataStore, key: string) -> (),
 	IncrementAsync: (self: DataStore, key: string, delta: number?, userIds: { number }?) -> number,
 	GetVersionAsync: (self: DataStore, key: string) -> string?,
+	InvalidateCache: (self: DataStore, key: string?) -> (),
 }
 
 export type DataStoreOptions = {
@@ -325,6 +528,8 @@ export type DataStoreOptions = {
 	scope: string,
 	namePrefix: string,
 	debug: boolean,
+	deepCopyOnRead: boolean,
+	updateAsyncMaxRetries: number,
 }
 
 local DataStore = {}
@@ -342,11 +547,9 @@ local function fullKey(prefix: string, key: string): string
 end
 
 local function assertKey(key: string)
-	if typeof(key) ~= "string" or key == "" then
-		error(Errors.toString(Errors.new("InvalidKey", "Key boş olamaz veya string olmalı")), 2)
-	end
-	if #key > 256 then
-		error(Errors.toString(Errors.new("InvalidKey", "Key 256 karakterden uzun olamaz")), 2)
+	local valid, reason = Util.isValidKey(key)
+	if not valid then
+		error(Errors.toString(Errors.new("InvalidKey", reason or "Invalid key")), 2)
 	end
 end
 
@@ -356,15 +559,27 @@ local function raiseIfError(err: Errors.DataStoreError?)
 	end
 end
 
+local function isVersionConflict(err: Errors.DataStoreError?): boolean
+	if not err then
+		return false
+	end
+	return err.StatusCode == 400 and string.find(err.Message, "DS_TAMPER") ~= nil
+		or string.find(err.Message, "TAMPER") ~= nil
+		or string.find(err.Message, "version") ~= nil
+end
+
 function DataStore.new(options: DataStoreOptions): DataStore
 	local self = setmetatable({}, DataStore)
 	self._client = options.httpClient
 	self._scope = options.scope
 	self._prefix = options.namePrefix
 	self._debug = options.debug
+	self._deepCopyOnRead = options.deepCopyOnRead
+	self._updateMaxRetries = options.updateAsyncMaxRetries
 	self._cache = {} :: { [string]: any }
 	self._cacheLoaded = {} :: { [string]: boolean }
 	self._versions = {} :: { [string]: number? }
+	self._queue = KeyQueue.new()
 	return self
 end
 
@@ -378,11 +593,17 @@ function DataStore:_log(message: string)
 	end
 end
 
+function DataStore:_maybeCopy<T>(value: T): T
+	if self._deepCopyOnRead and typeof(value) == "table" then
+		return Util.deepCopy(value)
+	end
+	return value
+end
+
 function DataStore:_parseGetResult(result: any?): any?
 	if result == nil then
 		return nil
 	end
-	-- Backend: { value: null } veya tam entry { payload, version, ... }
 	if result.payload ~= nil then
 		return result.payload
 	end
@@ -392,114 +613,150 @@ function DataStore:_parseGetResult(result: any?): any?
 	return result.value
 end
 
-function DataStore:GetAsync(key: string, options: { UseCache: boolean? }?): any?
-	assertKey(key)
-
-	if options and options.UseCache == false then
-		self._cacheLoaded[key] = false
-	elseif self._cacheLoaded[key] then
-		return self._cache[key]
-	end
-
-	local result, err = self._client:Request("GET", self:_path(key))
-	raiseIfError(err)
-
+function DataStore:_applyGetResult(key: string, result: any?): any?
 	local value = self:_parseGetResult(result)
 	if result and result.version then
 		self._versions[key] = result.version
 	end
-
 	self._cache[key] = value
 	self._cacheLoaded[key] = true
-	return value
+	return self:_maybeCopy(value)
+end
+
+function DataStore:InvalidateCache(key: string?)
+	if key then
+		self._cache[key] = nil
+		self._cacheLoaded[key] = false
+		self._versions[key] = nil
+	else
+		table.clear(self._cache)
+		table.clear(self._cacheLoaded)
+		table.clear(self._versions)
+	end
+end
+
+function DataStore:_fetchRemote(key: string): any?
+	local result, err = self._client:Request("GET", self:_path(key))
+	raiseIfError(err)
+	return self:_applyGetResult(key, result)
+end
+
+function DataStore:GetAsync(key: string, options: GetOptions?): any?
+	assertKey(key)
+
+	if options and options.UseCache == false then
+		self:InvalidateCache(key)
+	elseif self._cacheLoaded[key] then
+		return self:_maybeCopy(self._cache[key])
+	end
+
+	return self:_fetchRemote(key)
+end
+
+function DataStore:_write(
+	key: string,
+	method: string,
+	payload: any?,
+	pathSuffix: string?
+): (any?, Errors.DataStoreError?)
+	local path = if pathSuffix then `{self:_path(key)}{pathSuffix}` else self:_path(key)
+	local body = if payload ~= nil then payload else nil
+	return self._client:Request(method, path, body)
 end
 
 function DataStore:SetAsync(key: string, value: any, _userIds: { number }?): ()
 	assertKey(key)
+	self._queue:Enqueue(key, function()
+		local body: { key: string, scope: string, payload: any, expectedVersion: number? } = {
+			key = fullKey(self._prefix, key),
+			scope = self._scope,
+			payload = value,
+		}
+		local version = self._versions[key]
+		if version then
+			body.expectedVersion = version
+		end
 
-	local body: { key: string, scope: string, payload: any, expectedVersion: number? } = {
-		key = fullKey(self._prefix, key),
-		scope = self._scope,
-		payload = value,
-	}
-	local version = self._versions[key]
-	if version then
-		body.expectedVersion = version
-	end
+		local result, err = self:_write(key, "POST", body)
+		raiseIfError(err)
 
-	local result, err = self._client:Request("POST", self:_path(key), body)
-	raiseIfError(err)
-
-	if result and result.newVersion then
-		self._versions[key] = result.newVersion
-	end
-
-	self._cache[key] = value
-	self._cacheLoaded[key] = true
-	self:_log(`SetAsync "{key}"`)
+		if result and result.newVersion then
+			self._versions[key] = result.newVersion
+		end
+		self._cache[key] = value
+		self._cacheLoaded[key] = true
+		self:_log(`SetAsync "{key}"`)
+	end)
 end
 
 function DataStore:UpdateAsync(key: string, transform: (any?) -> any?, _userIds: { number }?): any?
 	assertKey(key)
 
-	local current = self:GetAsync(key)
-	local updated = transform(current)
+	return self._queue:Enqueue(key, function()
+		for attempt = 1, self._updateMaxRetries do
+			self:InvalidateCache(key)
+			local current = self:_fetchRemote(key)
+			local updated = transform(current)
 
-	-- Roblox: transform nil dönerse güncelleme iptal
-	if updated == nil then
-		return current
-	end
+			if updated == nil then
+				return self:_maybeCopy(current)
+			end
 
-	local body: { key: string, scope: string, payload: any, expectedVersion: number? } = {
-		key = fullKey(self._prefix, key),
-		scope = self._scope,
-		payload = updated,
-	}
-	local version = self._versions[key]
-	if version then
-		body.expectedVersion = version
-	end
+			local body: { key: string, scope: string, payload: any, expectedVersion: number? } = {
+				key = fullKey(self._prefix, key),
+				scope = self._scope,
+				payload = updated,
+			}
+			local version = self._versions[key]
+			if version then
+				body.expectedVersion = version
+			end
 
-	local result, err = self._client:Request("PUT", self:_path(key), body)
-	raiseIfError(err)
+			local result, err = self:_write(key, "PUT", body)
+			if err and isVersionConflict(err) and attempt < self._updateMaxRetries then
+				self:_log(`UpdateAsync "{key}" version conflict — retry {attempt}/{self._updateMaxRetries}`)
+				task.wait(0.1 * attempt)
+				continue
+			end
+			raiseIfError(err)
 
-	if result and result.newVersion then
-		self._versions[key] = result.newVersion
-	end
+			if result and result.newVersion then
+				self._versions[key] = result.newVersion
+			end
+			self._cache[key] = updated
+			self._cacheLoaded[key] = true
+			self:_log(`UpdateAsync "{key}"`)
+			return self:_maybeCopy(updated)
+		end
 
-	self._cache[key] = updated
-	self._cacheLoaded[key] = true
-	self:_log(`UpdateAsync "{key}"`)
-	return updated
+		error(Errors.toString(Errors.new("InternalError", "UpdateAsync failed after version retries")), 2)
+	end)
 end
 
 function DataStore:RemoveAsync(key: string): ()
 	assertKey(key)
-
-	local _, err = self._client:Request("DELETE", self:_path(key))
-	raiseIfError(err)
-
-	self._cache[key] = nil
-	self._cacheLoaded[key] = false
-	self._versions[key] = nil
-	self:_log(`RemoveAsync "{key}"`)
+	self._queue:Enqueue(key, function()
+		local _, err = self:_write(key, "DELETE")
+		raiseIfError(err)
+		self:InvalidateCache(key)
+		self:_log(`RemoveAsync "{key}"`)
+	end)
 end
 
 function DataStore:IncrementAsync(key: string, delta: number?, _userIds: { number }?): number
 	assertKey(key)
 
-	self._cacheLoaded[key] = false
+	return self._queue:Enqueue(key, function()
+		self:InvalidateCache(key)
+		local _, err = self:_write(key, "POST", { delta = delta or 1 }, "/increment")
+		raiseIfError(err)
 
-	local _, err = self._client:Request("POST", `{self:_path(key)}/increment`, {
-		delta = delta or 1,
-	})
-	raiseIfError(err)
-
-	local value = self:GetAsync(key, { UseCache = false })
-	if typeof(value) == "number" then
-		return value
-	end
-	return 0
+		local value = self:_fetchRemote(key)
+		if typeof(value) == "number" then
+			return value
+		end
+		return 0
+	end)
 end
 
 function DataStore:GetVersionAsync(key: string): string?
@@ -524,17 +781,259 @@ return DataStore
 ]]></ProtectedString>
       </Properties>
     </Item>
-    <Item class="ModuleScript" referent="RBX6">
+    <Item class="ModuleScript" referent="RBX8">
+      <Properties>
+        <string name="Name">DataSchema</string>
+        <token name="RunContext">0</token>
+        <ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Default player profile schema — extend for your game.
+	Used by PlayerDataManager for reconciliation on load.
+]]
+
+export type PlayerStats = {
+	Kills: number,
+	Deaths: number,
+}
+
+export type PlayerData = {
+	Coins: number,
+	Level: number,
+	Experience: number,
+	Inventory: { [string]: number },
+	Stats: PlayerStats,
+	LastLogin: number,
+}
+
+local DataSchema = {}
+
+DataSchema.DefaultProfile = {
+	Coins = 0,
+	Level = 1,
+	Experience = 0,
+	Inventory = {},
+	Stats = {
+		Kills = 0,
+		Deaths = 0,
+	},
+	LastLogin = 0,
+} :: PlayerData
+
+DataSchema.DataStoreName = "PlayerData"
+
+return DataSchema
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX9">
+      <Properties>
+        <string name="Name">PlayerDataManager</string>
+        <token name="RunContext">0</token>
+        <ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	PlayerDataManager — production-style session cache over SolarchDataStore.
+
+	- Load on join, save on leave (UpdateAsync only)
+	- Schema reconciliation after load
+	- Deep-copied reads (callers cannot corrupt session cache)
+	- BindToClose + periodic auto-save
+	- Fail-closed: kick on load failure
+
+	Usage:
+		local PlayerDataManager = require(ServerScriptService.SolarchDataStore.PlayerDataManager)
+		PlayerDataManager.Init()
+		local coins = PlayerDataManager.Get(player, "Coins")
+]]
+
+local Players = game:GetService("Players")
+
+local Config = require(script.Parent:WaitForChild("Config"))
+local DataSchema = require(script.Parent:WaitForChild("DataSchema"))
+local SolarchDataStore = require(script.Parent:WaitForChild("SolarchDataStore"))
+local Util = require(script.Parent:WaitForChild("Util"))
+
+export type PlayerData = DataSchema.PlayerData
+
+local PlayerDataManager = {}
+
+local SessionData: { [number]: PlayerData } = {}
+local Loaded: { [number]: boolean } = {}
+local store = SolarchDataStore:GetDataStore(DataSchema.DataStoreName)
+
+local AUTO_SAVE_INTERVAL = 120
+local BIND_TO_CLOSE_TIMEOUT = 30
+
+local function profileKey(userId: number): string
+	return "profile_" .. tostring(userId)
+end
+
+local function getPathValue(data: any, path: string): any
+	local parts = string.split(path, ".")
+	local current = data
+	for _, part in ipairs(parts) do
+		if typeof(current) ~= "table" then
+			return nil
+		end
+		current = current[part]
+	end
+	return current
+end
+
+local function setPathValue(data: any, path: string, value: any): boolean
+	local parts = string.split(path, ".")
+	local current = data
+	for i = 1, #parts - 1 do
+		local part = parts[i]
+		if typeof(current[part]) ~= "table" then
+			current[part] = {}
+		end
+		current = current[part]
+	end
+	current[parts[#parts]] = value
+	return true
+end
+
+function PlayerDataManager.IsLoaded(player: Player): boolean
+	return Loaded[player.UserId] == true
+end
+
+function PlayerDataManager.Get(player: Player, path: string): any
+	local data = SessionData[player.UserId]
+	if not data then
+		warn(`[PlayerDataManager] Get before load: {player.Name}`)
+		return nil
+	end
+	return Util.deepCopy(getPathValue(data, path))
+end
+
+function PlayerDataManager.Set(player: Player, path: string, value: any): boolean
+	local data = SessionData[player.UserId]
+	if not data then
+		return false
+	end
+	return setPathValue(data, path, value)
+end
+
+function PlayerDataManager.Increment(player: Player, path: string, delta: number): boolean
+	local current = PlayerDataManager.Get(player, path)
+	if typeof(current) ~= "number" then
+		current = 0
+	end
+	return PlayerDataManager.Set(player, path, current + delta)
+end
+
+function PlayerDataManager.GetProfile(player: Player): PlayerData?
+	local data = SessionData[player.UserId]
+	if not data then
+		return nil
+	end
+	return Util.deepCopy(data)
+end
+
+function PlayerDataManager.LoadProfile(player: Player): boolean
+	local key = profileKey(player.UserId)
+	local ok, result = pcall(function()
+		return store:GetAsync(key, { UseCache = false })
+	end)
+
+	if not ok then
+		warn(`[PlayerDataManager] Load failed for {player.Name}: {result}`)
+		player:Kick("Could not load your data. Please rejoin.")
+		return false
+	end
+
+	local profile: PlayerData
+	if result == nil then
+		profile = Util.deepCopy(DataSchema.DefaultProfile)
+	else
+		profile = Util.reconcile(result :: any, DataSchema.DefaultProfile) :: PlayerData
+	end
+
+	profile.LastLogin = os.time()
+	SessionData[player.UserId] = profile
+	Loaded[player.UserId] = true
+	return true
+end
+
+function PlayerDataManager.SaveProfile(player: Player): boolean
+	if not Loaded[player.UserId] then
+		return false
+	end
+
+	local key = profileKey(player.UserId)
+	local snapshot = Util.deepCopy(SessionData[player.UserId])
+
+	local ok, err = pcall(function()
+		store:UpdateAsync(key, function()
+			return snapshot
+		end)
+	end)
+
+	if not ok then
+		warn(`[PlayerDataManager] Save failed for {player.Name}: {err}`)
+		return false
+	end
+	return true
+end
+
+function PlayerDataManager.ReleasePlayer(player: Player)
+	PlayerDataManager.SaveProfile(player)
+	SessionData[player.UserId] = nil
+	Loaded[player.UserId] = nil
+end
+
+function PlayerDataManager.SaveAll()
+	for _, player in Players:GetPlayers() do
+		PlayerDataManager.SaveProfile(player)
+	end
+end
+
+function PlayerDataManager.Init()
+	Players.PlayerAdded:Connect(function(player)
+		PlayerDataManager.LoadProfile(player)
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		PlayerDataManager.ReleasePlayer(player)
+	end)
+
+	for _, player in Players:GetPlayers() do
+		task.spawn(PlayerDataManager.LoadProfile, player)
+	end
+
+	task.spawn(function()
+		while true do
+			task.wait(AUTO_SAVE_INTERVAL)
+			PlayerDataManager.SaveAll()
+		end
+	end)
+
+	game:BindToClose(function()
+		for _, player in Players:GetPlayers() do
+			task.spawn(function()
+				PlayerDataManager.SaveProfile(player)
+			end)
+		end
+		task.wait(BIND_TO_CLOSE_TIMEOUT)
+	end)
+
+	if Config.Debug then
+		print("[PlayerDataManager] Initialized")
+	end
+end
+
+return PlayerDataManager
+]]></ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX10">
       <Properties>
         <string name="Name">SolarchDataStore</string>
         <token name="RunContext">0</token>
         <ProtectedString name="Source"><![CDATA[--!strict
 --[[
 	Solarch External DataStoreService
-	Native DataStoreService yerine kullanın.
-
-	local DataStoreService = require(ServerScriptService.SolarchDataStore.SolarchDataStore)
-	local store = DataStoreService:GetDataStore("PlayerData")
+	Drop-in replacement for game:GetService("DataStoreService")
 ]]
 
 local Config = require(script.Parent:WaitForChild("Config"))
@@ -568,18 +1067,42 @@ local client = HttpClient.new({
 	debug = Config.Debug,
 })
 
+local instanceCache: { [string]: DataStore } = {}
+
+local function cacheKey(name: string, scope: string): string
+	return `{scope}::{name}`
+end
+
 function SolarchDataStoreService:GetDataStore(name: string, scope: string?): DataStore
-	assert(typeof(name) == "string" and name ~= "", "DataStore adı boş olamaz")
+	assert(typeof(name) == "string" and name ~= "", "DataStore name must be a non-empty string")
 	local ok, errMsg = Config.IsConfigured()
 	if not ok then
-		error(Errors.toString(Errors.new("ConfigError", errMsg or "Yapılandırma hatası")), 2)
+		error(Errors.toString(Errors.new("ConfigError", errMsg or "Configuration error")), 2)
 	end
-	return DataStoreModule.new({
+
+	local resolvedScope = scope or Config.DefaultScope
+	if Config.CacheDataStoreInstances then
+		local key = cacheKey(name, resolvedScope)
+		local cached = instanceCache[key]
+		if cached then
+			return cached
+		end
+	end
+
+	local ds = DataStoreModule.new({
 		httpClient = client,
-		scope = scope or Config.DefaultScope,
+		scope = resolvedScope,
 		namePrefix = name,
 		debug = Config.Debug,
+		deepCopyOnRead = Config.DeepCopyOnRead,
+		updateAsyncMaxRetries = Config.UpdateAsyncMaxRetries,
 	})
+
+	if Config.CacheDataStoreInstances then
+		instanceCache[cacheKey(name, resolvedScope)] = ds
+	end
+
+	return ds
 end
 
 function SolarchDataStoreService:GetGlobalDataStore(): DataStore
@@ -608,7 +1131,7 @@ return SolarchDataStoreService
 ]]></ProtectedString>
       </Properties>
     </Item>
-    <Item class="Script" referent="RBX7">
+    <Item class="Script" referent="RBX11">
       <Properties>
         <string name="Name">InstallGuide</string>
         <bool name="Disabled">true</bool>
@@ -649,14 +1172,14 @@ return nil
 ]]></ProtectedString>
       </Properties>
     </Item>
-    <Item class="Script" referent="RBX8">
+    <Item class="Script" referent="RBX12">
       <Properties>
         <string name="Name">SetupValidator</string>
         <bool name="Disabled">false</bool>
         <token name="RunContext">0</token>
         <ProtectedString name="Source"><![CDATA[--!strict
 --[[
-	Setup Validator — sunucu başlangıcında yapılandırma ve bağlantı testi.
+	Setup Validator — validates config and backend connectivity on server start.
 ]]
 
 local HttpService = game:GetService("HttpService")
@@ -675,22 +1198,19 @@ local function validate()
 	end
 
 	if not HttpService.HttpEnabled then
-		warnMsg("HttpService kapalı", "Game Settings → Security → Allow HTTP Requests")
+		warnMsg("HttpService disabled", "Game Settings → Security → Allow HTTP Requests")
 		return
 	end
 
 	local configured, configErr = Config.IsConfigured()
 	if not configured then
-		warnMsg("Yapılandırma eksik", configErr or "Config modülünü kontrol edin")
+		warnMsg("Configuration incomplete", configErr or "Check Config module")
 		return
 	end
 
 	local universeId = Config.GetUniverseId()
 	if universeId <= 0 then
-		warnMsg(
-			"UniverseId bulunamadı",
-			"Studio test için Config.StudioUniverseId veya Config.UniverseId ayarlayın"
-		)
+		warnMsg("UniverseId missing", "Set Config.StudioUniverseId or Config.UniverseId for Studio testing")
 		return
 	end
 
@@ -716,17 +1236,17 @@ local function validate()
 		end)
 
 		if not ok then
-			warnMsg("Backend'e bağlanılamadı", tostring(result))
+			warnMsg("Backend unreachable", tostring(result))
 			return
 		end
 
 		if not result.Success then
-			warnMsg("Backend oturum hatası", `HTTP {result.StatusCode}: {result.Body}`)
+			warnMsg("Session error", `HTTP {result.StatusCode}: {result.Body}`)
 			return
 		end
 
 		if Config.Debug then
-			print(`[SolarchDataStore] ✓ Kurulum OK — universe {universeId}, backend {apiUrl}`)
+			print(`[SolarchDataStore] ✓ Setup OK — universe {universeId}, backend {apiUrl}`)
 		end
 	end)
 end
@@ -735,67 +1255,24 @@ validate()
 ]]></ProtectedString>
       </Properties>
     </Item>
-    <Item class="Script" referent="RBX9">
+    <Item class="Script" referent="RBX13">
       <Properties>
         <string name="Name">ExampleUsage</string>
         <bool name="Disabled">true</bool>
         <token name="RunContext">0</token>
         <ProtectedString name="Source"><![CDATA[--!strict
 --[[
-	Örnek: Oyuncu profili kaydetme/yükleme.
-	Enable etmek için Script'in Disabled özelliğini false yapın.
+	Example — PlayerDataManager integration (recommended production path).
+	Enable this Script (Disabled = false) after configuring Config.
 ]]
 
-local Players = game:GetService("Players")
-local DataStoreService = require(script.Parent:WaitForChild("SolarchDataStore"))
+local PlayerDataManager = require(script.Parent:WaitForChild("PlayerDataManager"))
 
-local playerStore = DataStoreService:GetDataStore("PlayerData")
+PlayerDataManager.Init()
 
-local function loadProfile(player: Player)
-	local key = "profile_" .. player.UserId
-	local ok, profile = pcall(function()
-		return playerStore:GetAsync(key)
-	end)
-
-	if not ok then
-		warn(`[Example] {player.Name} yüklenemedi: {profile}`)
-		player:Kick("Veri sunucusuna bağlanılamadı. Lütfen tekrar deneyin.")
-		return
-	end
-
-	if profile == nil then
-		profile = { coins = 0, level = 1, lastLogin = os.time() }
-		local setOk, setErr = pcall(function()
-			playerStore:SetAsync(key, profile)
-		end)
-		if not setOk then
-			warn(`[Example] Profil oluşturulamadı: {setErr}`)
-			return
-		end
-	end
-
-	print(`[Example] {player.Name} — coins: {profile.coins}, level: {profile.level}`)
-end
-
-local function saveProfile(player: Player)
-	local key = "profile_" .. player.UserId
-	pcall(function()
-		playerStore:UpdateAsync(key, function(old)
-			local data = old or { coins = 0, level = 1 }
-			data.lastLogin = os.time()
-			return data
-		end)
-	end)
-end
-
-Players.PlayerAdded:Connect(loadProfile)
-Players.PlayerRemoving:Connect(saveProfile)
-
-game:BindToClose(function()
-	for _, player in Players:GetPlayers() do
-		saveProfile(player)
-	end
-end)
+-- Gameplay example:
+-- local coins = PlayerDataManager.Get(player, "Coins")
+-- PlayerDataManager.Increment(player, "Coins", 50)
 ]]></ProtectedString>
       </Properties>
     </Item>
